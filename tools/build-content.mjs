@@ -6,6 +6,7 @@ import { emit } from './lib/emit.mjs';
 import { ensureFullHistory } from './lib/git-history.mjs';
 import { collectAllChangelogs } from './lib/changelog.mjs';
 import { writeChangelogPages } from './lib/changelog-pages.mjs';
+import { writeOpenApiPages } from './lib/openapi.mjs';
 import { dim, green, red, yellow } from './lib/log.mjs';
 
 /**
@@ -25,8 +26,12 @@ export async function buildContent({ bust = false, label = 'docs' } = {}) {
   const changelog = await collectAllChangelogs(config);
   await writeChangelogPages(config, changelog);
 
-  const { docs, sections, assets, warnings } = await collectDocs(config);
-  await emit({ config, docs, sections, assets, changelog });
+  // Endpoint pages are generated the same way, and for the same reason:
+  // once they are real files, everything downstream treats them as pages.
+  await writeOpenApiPages(config);
+
+  const { docs, sections, assets, warnings, versions } = await collectDocs(config);
+  await emit({ config, docs, sections, assets, changelog, versions });
 
   const elapsed = Math.round(performance.now() - started);
   const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;

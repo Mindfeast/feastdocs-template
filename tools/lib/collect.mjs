@@ -6,6 +6,7 @@ import * as sass from 'sass';
 import { paths } from './config.mjs';
 import { createRenderer, collectFenceLanguages } from './markdown.mjs';
 import { collectGitMeta } from './git-meta.mjs';
+import { applyReuse, loadSnippets } from './reuse.mjs';
 
 const DOC_GLOB = ['**/*.md', '**/*.markdown', '**/*.html'];
 /** Deepest allowed nesting: a section plus four category levels. */
@@ -23,7 +24,71 @@ const NON_ASSET = /\.(md|markdown|html|scss|sass|css)$/i;
  * section and render without a sidebar — that is how the landing page works.
  */
 export async function collectDocs(config) {
-  const docsRoot = paths.docs(config);
+  const versions = normaliseVersions(config);
+
+  // The common case is one unversioned docs folder, and it must stay exactly
+  // as it was: same slugs, same section ids, no prefixes anywhere.
+  const collected = [];
+  for (const version of versions) {
+    collected.push(await collectVersion(config, version));
+  }
+
+  // Links are checked once, after every version is in: a link from one version
+  // to another is legitimate, and checking per version would call it broken.
+  const allDocs = collected.flatMap((one) => one.docs);
+  const allWarnings = collected.flatMap((one) => one.warnings);
+  validateLinks(allDocs, new Map(allDocs.map((doc) => [doc.slug, doc])), (message) =>
+    allWarnings.push(message),
+  );
+
+  return {
+    docs: allDocs,
+    sections: collected.flatMap((one) => one.sections),
+    assets: [...new Set(collected.flatMap((one) => one.assets))],
+    warnings: allWarnings,
+    versions: versions.map(({ id, label, prefix, isDefault }) => ({
+      id,
+      label,
+      prefix,
+      isDefault,
+    })),
+  };
+}
+
+/**
+ * One entry per documented version, newest first, with the default version
+ * carrying no route prefix. An empty `versions` config yields a single
+ * unversioned entry, which is what most sites are.
+ */
+export function normaliseVersions(config) {
+  const declared = config.versions ?? [];
+  if (declared.length === 0) {
+    return [
+      { id: '', label: '', prefix: '', docsDir: config.docsDir, isDefault: true, editUrl: null },
+    ];
+  }
+
+  const defaultIndex = Math.max(
+    0,
+    declared.findIndex((version) => version.default === true),
+  );
+
+  return declared.map((version, index) => {
+    const isDefault = index === defaultIndex;
+    return {
+      id: String(version.id),
+      label: String(version.label ?? version.id),
+      // The default version owns the bare routes; the rest are namespaced.
+      prefix: isDefault ? '' : String(version.slug ?? version.id),
+      docsDir: version.docsDir ?? config.docsDir,
+      isDefault,
+      editUrl: version.editUrl ?? null,
+    };
+  });
+}
+
+async function collectVersion(config, version) {
+  const docsRoot = path.join(paths.root, version.docsDir);
   const warnings = [];
   const warn = (message) => warnings.push(message);
 
@@ -48,13 +113,18 @@ export async function collectDocs(config) {
     }),
   );
 
-  const [renderer, gitMeta] = await Promise.all([
-    createRenderer({
-      langs: collectFenceLanguages(files.map((f) => f.raw)),
-      onWarning: warn,
-    }),
-    collectGitMeta(docsRoot),
+  const [snippets, [renderer, gitMeta]] = await Promise.all([
+    loadSnippets(docsRoot),
+    Promise.all([
+      createRenderer({
+        langs: collectFenceLanguages(files.map((f) => f.raw)),
+        onWarning: warn,
+      }),
+      collectGitMeta(docsRoot),
+    ]),
   ]);
+
+  const reuse = { snippets, variables: config.variables ?? {}, onWarning: warn };
 
   const docs = [];
   for (const file of files) {
@@ -65,7 +135,7 @@ export async function collectDocs(config) {
           `(a section plus seven category levels). The page still renders, but flatten it.`,
       );
     }
-    docs.push(await buildDoc(file, { renderer, docsRoot, warn, gitMeta }));
+    docs.push(await buildDoc(file, { renderer, docsRoot, warn, gitMeta, reuse }));
   }
 
   const bySlug = new Map();
@@ -79,7 +149,6 @@ export async function collectDocs(config) {
   }
 
   const pages = [...bySlug.values()].filter((doc) => !doc.draft);
-  validateLinks(pages, bySlug, warn);
 
   const [categories, sectionMeta] = await Promise.all([
     readJsonSidecars(docsRoot, '**/_category.json'),
@@ -105,7 +174,45 @@ export async function collectDocs(config) {
     onlyFiles: true,
   }).then((all) => all.filter((f) => !NON_ASSET.test(f)).map((f) => f.split(path.sep).join('/')));
 
+  if (version.prefix !== '') applyPrefix(pages, sections, version);
+  for (const doc of pages) doc.version = version.id;
+  for (const section of sections) section.version = version.id;
+
   return { docs: pages, sections, assets, warnings };
+}
+
+/**
+ * Namespaces a non-default version under its own route prefix. Slugs, section
+ * ids and the links between pages all move together, so a v1 page never links
+ * into v2 by accident.
+ */
+function applyPrefix(pages, sections, version) {
+  const prefix = version.prefix;
+  const move = (slug) => (slug == null ? slug : `${prefix}/${slug}`.replace(/\/+$/, ''));
+
+  for (const doc of pages) {
+    doc.slug = move(doc.slug);
+    doc.section = doc.section === null ? null : `${prefix}--${doc.section}`;
+    doc.prev = move(doc.prev);
+    doc.next = move(doc.next);
+    // An edit link must point at the file that was actually read.
+    doc.editUrl =
+      version.editUrl === null ? null : `${version.editUrl.replace(/\/?$/, '/')}${doc.sourcePath}`;
+    if (version.editUrl === null) doc.sourcePath = '';
+    doc.html = doc.html.replace(/(href=")\/(?!\/)/g, (match, head) => `${head}/${prefix}/`);
+  }
+
+  const walk = (items) => {
+    for (const item of items) {
+      if (item.slug != null) item.slug = move(item.slug);
+      if (item.items) walk(item.items);
+    }
+  };
+  for (const section of sections) {
+    section.id = `${prefix}--${section.id}`;
+    section.slug = move(section.slug);
+    walk(section.items);
+  }
 }
 
 /**
@@ -151,14 +258,18 @@ function buildCategoryIndex(category, pages) {
   };
 }
 
-async function buildDoc(file, { renderer, docsRoot, warn, gitMeta }) {
+async function buildDoc(file, { renderer, docsRoot, warn, gitMeta, reuse }) {
   const { relative, raw, stat } = file;
   const isHtml = /\.html$/i.test(relative);
   const parsed = matter(raw);
   const data = parsed.data ?? {};
 
   const { slug, dirSlug } = computeSlug(relative, data.slug);
-  const stripped = isHtml ? stripHtmlH1(parsed.content) : stripMarkdownH1(parsed.content);
+
+  // Snippets and variables resolve before anything reads the content, so the
+  // rendered HTML, the headings and the search index all see the real text.
+  const content = applyReuse(parsed.content, { ...reuse, where: relative });
+  const stripped = isHtml ? stripHtmlH1(content) : stripMarkdownH1(content);
 
   const title =
     data.title?.toString().trim() ||
@@ -185,6 +296,9 @@ async function buildDoc(file, { renderer, docsRoot, warn, gitMeta }) {
     description: (data.description ?? '').toString(),
     sidebarLabel: (data.sidebar_label ?? data.sidebarLabel ?? title).toString(),
     sidebarPosition: toNumber(rawPosition, 999),
+    // A short marker beside the label — an HTTP method, a status, anything
+    // worth scanning for. Generated API pages set it to their method.
+    sidebarBadge: (data.sidebar_badge ?? data.sidebarBadge ?? '').toString(),
     hasExplicitPosition: rawPosition != null,
     hidden: data.hidden === true,
     draft: data.draft === true,
@@ -354,6 +468,7 @@ function buildTree(docs, categories, sectionFolder, generatedIndexes = []) {
       type: 'doc',
       slug: doc.slug,
       label: doc.sidebarLabel,
+      badge: doc.sidebarBadge || undefined,
       // The section landing sits at the top unless it asks for another spot.
       position: isIndex && !doc.hasExplicitPosition ? -1 : doc.sidebarPosition,
     });

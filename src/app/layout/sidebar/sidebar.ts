@@ -17,6 +17,7 @@ interface Row {
   readonly depth: number;
   readonly expandable: boolean;
   readonly expanded: boolean;
+  readonly badge?: string;
 }
 
 /**
@@ -51,6 +52,15 @@ export class Sidebar {
   );
 
   protected readonly section = computed(() => this.content.sectionOf(this.currentSlug()));
+
+  /**
+   * Sections for the mobile drawer, scoped to the version being read — the
+   * drawer is the only navigation on a narrow screen, so listing another
+   * version's sections there would be a trapdoor out of v1.
+   */
+  protected readonly visibleSections = computed(() =>
+    this.content.sectionsFor(this.content.versionOf(this.currentSlug())),
+  );
 
   protected readonly rows = computed<readonly Row[]>(() => {
     const section = this.section();
@@ -116,6 +126,7 @@ export class Sidebar {
             depth,
             expandable: false,
             expanded: false,
+            badge: item.badge,
           });
           continue;
         }
