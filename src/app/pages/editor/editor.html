@@ -1,0 +1,490 @@
+<div class="fd-editor">
+  @if (unavailable()) {
+    <div class="fd-editor__offline">
+      <h1>Content manager</h1>
+      <p>
+        No editing backend is available. Locally, start the dev server; for editing on
+        the deployed site, set <code>github.repo</code> in
+        <code>feastdocs.config.mjs</code>.
+      </p>
+      <pre><code>npm start</code></pre>
+      <button type="button" class="fd-button" (click)="refreshFiles()">Retry</button>
+    </div>
+  } @else if (needsConnect()) {
+    <div class="fd-editor__offline">
+      <h1>Connect GitHub</h1>
+      <p>
+        Edits made here are committed to
+        <strong>{{ github.repo }}</strong> ({{ github.branch }}) in your name — only
+        accounts with write access to the repository can publish.
+      </p>
+
+      @if (oauthConfigured) {
+        <button
+          type="button"
+          class="fd-button fd-editor__signin"
+          [disabled]="connecting()"
+          (click)="signIn()"
+        >
+          <svg viewBox="0 0 16 16" aria-hidden="true">
+            <path
+              d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.42 7.42 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"
+            />
+          </svg>
+          {{ connecting() ? 'Signing in…' : 'Sign in with GitHub' }}
+        </button>
+      }
+
+      <details class="fd-editor__pat" [attr.open]="oauthConfigured ? null : true">
+        <summary>{{ oauthConfigured ? 'Use a token instead' : 'Connect with a token' }}</summary>
+        <p class="fd-editor__fineprint">
+          Paste a fine-grained personal access token with
+          <em>contents read and write</em> on the repository. It stays in this
+          browser (localStorage) and talks only to api.github.com.
+        </p>
+        <form class="fd-editor__connect" (submit)="$event.preventDefault(); connect()">
+          <input
+            type="password"
+            placeholder="github_pat_…"
+            aria-label="GitHub personal access token"
+            autocomplete="off"
+            [value]="tokenInput()"
+            (input)="tokenInput.set($any($event.target).value)"
+          />
+          <button type="submit" class="fd-button" [disabled]="connecting()">
+            {{ connecting() ? 'Connecting…' : 'Connect' }}
+          </button>
+        </form>
+      </details>
+
+      @if (status().kind === 'error') {
+        <p class="fd-editor__error">{{ $any(status()).message }}</p>
+      }
+      @if (!oauthConfigured) {
+        <p class="fd-editor__fineprint">
+          Want a real sign-in button? Create a GitHub OAuth App, set
+          <code>github.oauthClientId</code> in <code>feastdocs.config.mjs</code>, and
+          add the app's secret to the Cloudflare Pages project — the exchange
+          function ships in <code>functions/</code>.
+        </p>
+      }
+      @if (localAvailable()) {
+        <button type="button" class="fd-editor__link" (click)="setMode('local')">
+          Use local files instead
+        </button>
+      }
+    </div>
+  } @else {
+    <aside class="fd-editor__files">
+      @if (localAvailable() && github.isConfigured) {
+        <div class="fd-editor__mode" role="tablist" aria-label="Editing backend">
+          <button
+            type="button"
+            role="tab"
+            [attr.aria-selected]="mode() === 'local'"
+            [class.is-active]="mode() === 'local'"
+            (click)="setMode('local')"
+          >
+            Local
+          </button>
+          <button
+            type="button"
+            role="tab"
+            [attr.aria-selected]="mode() === 'github'"
+            [class.is-active]="mode() === 'github'"
+            (click)="setMode('github')"
+          >
+            GitHub
+          </button>
+        </div>
+      }
+
+      @if (mode() === 'github' && github.user(); as user) {
+        <div class="fd-editor__account">
+          <img [src]="user.avatarUrl" alt="" width="22" height="22" />
+          <span>{{ user.name || user.login }}</span>
+          <button type="button" (click)="disconnect()">Sign out</button>
+        </div>
+        @if (readOnly()) {
+          <p class="fd-editor__readonly">
+            <strong>Sandbox mode.</strong> Explore and edit anything — type,
+            preview, try the components. Nothing leaves your browser, because
+            this account cannot push to <code>{{ github.repo }}</code>. Ask the
+            owner for write access to publish.
+          </p>
+        }
+      }
+
+      <div class="fd-editor__files-head">
+        <span>docs/</span>
+        <span class="fd-editor__newgroup">
+          <button
+            type="button"
+            class="fd-editor__new"
+            (click)="startBlank()"
+            [attr.aria-expanded]="creating()"
+          >
+            + New
+          </button>
+          @if (templates().length > 0) {
+            <span class="fd-editor__tpl">
+              <button
+                type="button"
+                class="fd-editor__new"
+                (click)="templateMenuOpen.set(!templateMenuOpen())"
+                [attr.aria-expanded]="templateMenuOpen()"
+                aria-haspopup="menu"
+              >
+                From template ▾
+              </button>
+              @if (templateMenuOpen()) {
+                <div class="fd-editor__tplmenu" role="menu">
+                  @for (t of templates(); track t) {
+                    <button type="button" role="menuitem" (click)="startFromTemplate(t)">
+                      {{ templateLabel(t) }}
+                    </button>
+                  }
+                </div>
+              }
+            </span>
+          }
+        </span>
+      </div>
+
+      @if (creating()) {
+        <form class="fd-editor__create" (submit)="$event.preventDefault(); create()">
+          @if (newTemplate()) {
+            <span class="fd-editor__tplchip">
+              From template: <strong>{{ templateLabel(newTemplate()) }}</strong>
+              <button type="button" aria-label="Use a blank page instead" (click)="newTemplate.set('')">
+                ✕
+              </button>
+            </span>
+          }
+          <div class="fd-editor__create-row">
+            <input
+              type="text"
+              placeholder="guide/deploying.md"
+              aria-label="Path of the new file, relative to docs/"
+              [value]="newPath()"
+              (input)="newPath.set($any($event.target).value)"
+            />
+            <button type="submit" class="fd-button">Create</button>
+          </div>
+        </form>
+      }
+
+      <input
+        class="fd-editor__filter"
+        type="search"
+        placeholder="Filter files"
+        aria-label="Filter files"
+        [value]="filter()"
+        (input)="filter.set($any($event.target).value)"
+      />
+
+      <ul class="fd-editor__list">
+        @for (row of tree(); track row.kind + row.path) {
+          @if (row.kind === 'folder') {
+            <li class="fd-editor__treerow" [style.padding-inline-start.px]="row.depth * 12">
+              <button type="button" class="fd-editor__folder" (click)="toggleFolder(row.path)">
+                <svg viewBox="0 0 24 24" aria-hidden="true" [class.is-open]="row.expanded">
+                  <path d="M9 6l6 6-6 6" />
+                </svg>
+                {{ row.name }}
+              </button>
+            </li>
+          } @else {
+            <li
+              class="fd-editor__treerow fd-editor__row"
+              [class.is-dragging]="dragPath() === row.path"
+              [class.drop-before]="dropHint(row.path) === 'before'"
+              [class.drop-after]="dropHint(row.path) === 'after'"
+              [style.padding-inline-start.px]="row.depth * 12"
+              [attr.draggable]="row.draggable ? true : null"
+              (dragstart)="onDragStart(row.path, $event)"
+              (dragover)="onDragOver(row.path, $event)"
+              (drop)="onDrop($event)"
+              (dragend)="onDragEnd()"
+            >
+              <button
+                type="button"
+                class="fd-editor__file"
+                [class.fd-editor__file--active]="row.path === selected()"
+                [class.fd-editor__file--deleted]="pendingKind(row.path) === 'delete'"
+                [attr.title]="row.path"
+                (click)="open(row.path)"
+              >
+                {{ row.name }}
+                @switch (pendingKind(row.path)) {
+                  @case ('edit') {
+                    <span class="fd-editor__badge fd-editor__badge--edit" title="Staged edit">M</span>
+                  }
+                  @case ('create') {
+                    <span class="fd-editor__badge fd-editor__badge--create" title="Staged new file">A</span>
+                  }
+                  @case ('delete') {
+                    <span class="fd-editor__badge fd-editor__badge--delete" title="Staged deletion">D</span>
+                  }
+                }
+              </button>
+              @if (pendingKind(row.path) !== null && mode() === 'github') {
+                <button
+                  type="button"
+                  class="fd-editor__rowaction"
+                  title="Undo staged change"
+                  (click)="unstage(row.path, $event)"
+                >
+                  &#8634;
+                </button>
+              } @else {
+                <button
+                  type="button"
+                  class="fd-editor__rowaction fd-editor__rowaction--danger"
+                  [attr.title]="mode() === 'github' ? 'Stage deletion' : 'Delete file'"
+                  (click)="remove(row.path, $event)"
+                >
+                  &#10005;
+                </button>
+              }
+            </li>
+          }
+        }
+      </ul>
+
+    </aside>
+
+    <section class="fd-editor__work">
+      <header class="fd-editor__bar">
+        <span class="fd-editor__path">
+          {{ selected() ?? 'No file selected' }}
+          @if (dirty()) {
+            <span class="fd-editor__dirty" title="Unsaved changes">●</span>
+          }
+        </span>
+
+        <span class="fd-editor__status" aria-live="polite">
+          @switch (status().kind) {
+            @case ('saving') {
+              {{ mode() === 'github' ? 'Working…' : 'Saving…' }}
+            }
+            @case ('saved') {
+              {{ $any(status()).detail }}
+            }
+            @case ('error') {
+              <span class="fd-editor__error">{{ $any(status()).message }}</span>
+            }
+          }
+        </span>
+
+        <span class="fd-editor__actions">
+          @if (pageRoute(); as route) {
+            <a class="fd-editor__view" [href]="route" target="_blank">View page ↗</a>
+          }
+          <button
+            type="button"
+            class="fd-button"
+            [class.fd-button--ghost]="mode() === 'github' && pendingCount() > 0"
+            [disabled]="!dirty() || readOnly()"
+            [attr.title]="readOnly() ? 'No write access to the repository' : null"
+            (click)="save()"
+          >
+            {{ mode() === 'github' ? 'Stage' : 'Save' }}
+            <kbd>Ctrl S</kbd>
+          </button>
+          @if (mode() === 'github' && pendingCount() > 0) {
+            <button
+              type="button"
+              class="fd-button fd-button--commit"
+              [disabled]="readOnly()"
+              (click)="commitAll()"
+            >
+              Commit {{ pendingCount() }} change{{ pendingCount() === 1 ? '' : 's' }}
+            </button>
+          }
+        </span>
+      </header>
+
+      <!-- Staged-changes strip: impossible to miss, carries the commit message. -->
+      @if (mode() === 'github' && pendingCount() > 0) {
+        <div class="fd-editor__stagebar">
+          <span class="fd-editor__stagecount">
+            {{ pendingCount() }} staged change{{ pendingCount() === 1 ? '' : 's' }}
+          </span>
+          <input
+            type="text"
+            placeholder="Commit message (optional — a sensible default is used)"
+            aria-label="Commit message"
+            [value]="commitMessage()"
+            (input)="commitMessage.set($any($event.target).value)"
+            (keydown.enter)="commitAll()"
+          />
+        </div>
+      }
+
+      <!-- Conflicts: someone else changed these files since we read them. -->
+      @if (conflicts().length > 0) {
+        <div class="fd-editor__conflicts" role="alert">
+          <p class="fd-editor__conflicts-title">
+            Changed by someone else while you were editing — choose per file:
+          </p>
+          @for (path of conflicts(); track path) {
+            <div class="fd-editor__conflict">
+              <code>{{ path }}</code>
+              <span class="fd-editor__conflict-actions">
+                <button type="button" class="is-merge" (click)="openResolve(path)" title="Resolve hunk by hunk in the merge editor">
+                  Merge…
+                </button>
+                <button type="button" (click)="resolveTheirs(path)" title="Discard my staged change and load their version">
+                  Use theirs
+                </button>
+                <button type="button" class="is-mine" (click)="resolveMine(path)" title="Commit my version over theirs">
+                  Keep mine
+                </button>
+              </span>
+            </div>
+          }
+        </div>
+      }
+
+      <div class="fd-editor__panes">
+        <div class="fd-editor__sourcewrap">
+          <div class="fd-editor__toolbar">
+            <span class="fd-editor__insert">
+              <button
+                type="button"
+                (click)="openToolbarInsert()"
+                [attr.aria-expanded]="insertMenuOpen()"
+                aria-haspopup="menu"
+              >
+                + Insert ▾
+              </button>
+              @if (insertMenuOpen() && insertAnchor() === 'toolbar') {
+                <div class="fd-editor__insertmenu" role="menu">
+                  @for (group of insertGroups; track group) {
+                    <span class="fd-editor__insertgroup">{{ group }}</span>
+                    @for (item of insertSnippets; track item.label) {
+                      @if (item.group === group) {
+                        <button type="button" role="menuitem" (click)="insert(item)">
+                          {{ item.label }}
+                        </button>
+                      }
+                    }
+                  }
+                </div>
+              }
+            </span>
+          </div>
+          <textarea
+            #source
+            class="fd-editor__source"
+            spellcheck="false"
+            aria-label="File content"
+            [value]="contentText()"
+            (input)="contentText.set($any($event.target).value); updateInlineInsert()"
+            (keyup)="updateInlineInsert()"
+            (click)="updateInlineInsert()"
+            (scroll)="updateInlineInsert(); syncScroll('source')"
+          ></textarea>
+
+          @if (inlineInsertTop() !== null) {
+            <button
+              type="button"
+              class="fd-editor__inlineplus"
+              [style.top.px]="inlineInsertTop()"
+              title="Insert here"
+              aria-label="Insert content here"
+              (mousedown)="openInlineInsert($event)"
+            >
+              +
+            </button>
+            @if (insertMenuOpen() && insertAnchor() === 'inline') {
+              <div
+                class="fd-editor__insertmenu fd-editor__insertmenu--inline"
+                role="menu"
+                [style.top.px]="inlineInsertTop()! + 24"
+              >
+                @for (group of insertGroups; track group) {
+                  <span class="fd-editor__insertgroup">{{ group }}</span>
+                  @for (item of insertSnippets; track item.label) {
+                    @if (item.group === group) {
+                      <button type="button" role="menuitem" (mousedown)="$event.preventDefault()" (click)="insert(item)">
+                        {{ item.label }}
+                      </button>
+                    }
+                  }
+                }
+              </div>
+            }
+          }
+        </div>
+
+        <div class="fd-editor__preview" #previewPane (scroll)="syncScroll('preview')">
+          @if (isMarkdown()) {
+            <div class="fd-markdown" [innerHTML]="preview()"></div>
+          } @else {
+            <p class="fd-editor__nopreview">
+              Preview is available for Markdown files. This file still saves normally.
+            </p>
+          }
+        </div>
+      </div>
+    </section>
+
+    @if (resolving(); as merge) {
+      <div class="fd-resolve" role="dialog" aria-modal="true" aria-label="Resolve conflict">
+        <div class="fd-resolve__panel">
+          <header class="fd-resolve__head">
+            <code>{{ merge.path }}</code>
+            <span class="fd-resolve__progress">
+              @if (resolveRemaining() > 0) {
+                {{ resolveRemaining() }} conflict{{ resolveRemaining() === 1 ? '' : 's' }} left
+              } @else {
+                All conflicts resolved
+              }
+            </span>
+            <span class="fd-resolve__actions">
+              <button type="button" class="fd-editor__link" (click)="cancelResolve()">Cancel</button>
+              <button
+                type="button"
+                class="fd-button"
+                [disabled]="resolveRemaining() > 0"
+                (click)="applyResolve()"
+              >
+                Apply merge
+              </button>
+            </span>
+          </header>
+
+          <div class="fd-resolve__body">
+            @for (hunk of merge.hunks; track $index) {
+              @if (hunk.kind === 'same') {
+                <pre class="fd-resolve__same">{{ hunk.same }}</pre>
+              } @else {
+                <div class="fd-resolve__hunk" [class.is-resolved]="hunk.choice !== null">
+                  <div
+                    class="fd-resolve__side fd-resolve__side--theirs"
+                    [class.is-chosen]="hunk.choice === 'theirs' || hunk.choice === 'both'"
+                  >
+                    <button type="button" (click)="chooseHunk($index, 'theirs')">Use theirs</button>
+                    <pre>{{ hunk.theirs || '(nothing)' }}</pre>
+                  </div>
+                  <div
+                    class="fd-resolve__side fd-resolve__side--mine"
+                    [class.is-chosen]="hunk.choice === 'mine' || hunk.choice === 'both'"
+                  >
+                    <button type="button" (click)="chooseHunk($index, 'mine')">Use mine</button>
+                    <pre>{{ hunk.mine || '(nothing)' }}</pre>
+                  </div>
+                  <button type="button" class="fd-resolve__both" (click)="chooseHunk($index, 'both')">
+                    Use both
+                  </button>
+                </div>
+              }
+            }
+          </div>
+        </div>
+      </div>
+    }
+  }
+</div>
