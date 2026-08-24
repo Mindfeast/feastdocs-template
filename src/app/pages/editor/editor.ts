@@ -2,6 +2,7 @@ import { HttpClient } from '@angular/common/http';
 import {
   Component,
   ElementRef,
+  afterRenderEffect,
   computed,
   effect,
   inject,
@@ -52,7 +53,12 @@ interface TreeRow {
   readonly draggable: boolean;
 }
 
-const FOLDERS_KEY = 'feastdocs:editor-folders';
+// Holds the folders the reader has opened, not the ones they closed: a fresh
+// tree should start shut, and an empty set is the only honest way to say that
+// before the tree has been walked and the folder paths are even known. The key
+// is distinct from the old one so a stored list of *closed* folders from a
+// previous version is not read back as a list of open ones.
+const FOLDERS_KEY = 'feastdocs:editor-folders-open';
 /** Positions are rewritten in tens, leaving room to insert by hand later. */
 const POSITION_STEP = 10;
 
@@ -226,6 +232,7 @@ export class Editor {
   /** Where the open insert menu is anchored: the toolbar or the caret line. */
   protected readonly insertAnchor = signal<'toolbar' | 'inline'>('toolbar');
 
+  private readonly fileList = viewChild<ElementRef<HTMLElement>>('fileList');
   private readonly sourceArea = viewChild<ElementRef<HTMLTextAreaElement>>('source');
   private readonly previewPane = viewChild<ElementRef<HTMLElement>>('previewPane');
 
@@ -333,8 +340,8 @@ export class Editor {
 
   // --- File tree -------------------------------------------------------------
 
-  /** Collapsed folders, persisted per reader. */
-  private readonly collapsedFolders = signal<ReadonlySet<string>>(this.readCollapsedFolders());
+  /** Folders the reader has opened, persisted. Everything else stays shut. */
+  private readonly expandedFolders = signal<ReadonlySet<string>>(this.readExpandedFolders());
   /** Base order: how the sidebar sorted pages at the last build. */
   private readonly baseOrder = new Map(PAGE_ORDER.map((path, index) => [path, index]));
   /**
@@ -348,21 +355,14 @@ export class Editor {
   protected readonly dropTarget = signal<{ path: string; after: boolean } | null>(null);
 
   /**
-   * The file list as a tree. Filtering flattens it to matches — a filtered
-   * tree hides the very rows you searched for behind collapsed parents.
+   * The file list as a tree. A filter matches the whole path, so typing a
+   * folder name keeps everything inside it — and while a filter is on, every
+   * folder is drawn open, or the tree would hide the very rows you searched
+   * for behind branches you happen to have closed.
    */
   protected readonly tree = computed<readonly TreeRow[]>(() => {
     const files = this.visibleFiles();
-    if (this.filter().trim()) {
-      return files.map((path) => ({
-        kind: 'file' as const,
-        name: path,
-        path,
-        depth: 0,
-        expanded: false,
-        draggable: false,
-      }));
-    }
+    const filtering = this.filter().trim().length > 0;
 
     interface Node {
       folders: Map<string, Node>;
@@ -383,14 +383,14 @@ export class Editor {
       node.files.push(path);
     }
 
-    const collapsed = this.collapsedFolders();
+    const expanded = this.expandedFolders();
     const rows: TreeRow[] = [];
     const walk = (node: Node, prefix: string, depth: number): void => {
       for (const name of [...node.folders.keys()].sort()) {
         const path = prefix ? `${prefix}/${name}` : name;
-        const isCollapsed = collapsed.has(path);
-        rows.push({ kind: 'folder', name, path, depth, expanded: !isCollapsed, draggable: false });
-        if (!isCollapsed) walk(node.folders.get(name)!, path, depth + 1);
+        const isExpanded = filtering || expanded.has(path);
+        rows.push({ kind: 'folder', name, path, depth, expanded: isExpanded, draggable: false });
+        if (isExpanded) walk(node.folders.get(name)!, path, depth + 1);
       }
       for (const path of this.sortSiblings(node.files)) {
         rows.push({
@@ -399,7 +399,9 @@ export class Editor {
           path,
           depth,
           expanded: false,
-          draggable: this.isReorderable(path),
+          // Dragging reorders siblings, which only means anything against the
+          // full list — a filtered tree is showing a subset of them.
+          draggable: !filtering && this.isReorderable(path),
         });
       }
     };
@@ -408,15 +410,11 @@ export class Editor {
   });
 
   protected toggleFolder(path: string): void {
-    this.collapsedFolders.update((current) => {
+    this.expandedFolders.update((current) => {
       const next = new Set(current);
       if (next.has(path)) next.delete(path);
       else next.add(path);
-      try {
-        localStorage.setItem(FOLDERS_KEY, JSON.stringify([...next]));
-      } catch {
-        // Expansion state is a convenience; losing it is not worth surfacing.
-      }
+      this.persistFolders(next);
       return next;
     });
   }
@@ -437,12 +435,20 @@ export class Editor {
     return !/(^|\/)index\.[^.]+$/i.test(path);
   }
 
-  private readCollapsedFolders(): ReadonlySet<string> {
+  private persistFolders(folders: ReadonlySet<string>): void {
+    try {
+      localStorage.setItem(FOLDERS_KEY, JSON.stringify([...folders]));
+    } catch {
+      // Expansion state is a convenience; losing it is not worth surfacing.
+    }
+  }
+
+  private readExpandedFolders(): ReadonlySet<string> {
     try {
       const stored = localStorage.getItem(FOLDERS_KEY);
       if (stored) return new Set<string>(JSON.parse(stored) as string[]);
     } catch {
-      // Unreadable — start fully expanded.
+      // Unreadable — start fully collapsed, same as a first visit.
     }
     return new Set();
   }
@@ -667,6 +673,21 @@ export class Editor {
     // Reaching this page retires the navbar's invitation for good.
     inject(UiStateService).markEditorVisited();
     void this.start();
+
+    // Bring the open file into view. Folders start closed and a filter can
+    // hide the row entirely, so opening a file has to reveal where it lives —
+    // otherwise the tree and the editor disagree about what you are editing.
+    // Guarded on the path so a re-render does not fight the reader's scrolling.
+    afterRenderEffect(() => {
+      const path = this.selected();
+      // Read the tree so this re-runs once the row for `path` actually exists.
+      this.tree();
+      if (path === null || path === this.revealed) return;
+      const row = this.fileList()?.nativeElement.querySelector('.fd-editor__file--active');
+      if (!row) return;
+      this.revealed = path;
+      row.scrollIntoView({ block: 'nearest' });
+    });
 
     // Warn about unsaved or uncommitted work when leaving the tab.
     effect((onCleanup) => {
@@ -1242,7 +1263,28 @@ export class Editor {
     this.pending.set(next);
   }
 
+  /** The path the tree was last scrolled to. */
+  private revealed: string | null = null;
+
+  /** Opens every folder on the way to a file, so its row is actually drawn. */
+  private revealFolders(path: string): void {
+    const parts = path.split('/').slice(0, -1);
+    if (parts.length === 0) return;
+    this.expandedFolders.update((current) => {
+      const next = new Set(current);
+      let prefix = '';
+      for (const part of parts) {
+        prefix = prefix ? `${prefix}/${part}` : part;
+        next.add(prefix);
+      }
+      if (next.size === current.size) return current;
+      this.persistFolders(next);
+      return next;
+    });
+  }
+
   private applyOpened(path: string, content: string): void {
+    this.revealFolders(path);
     this.selected.set(path);
     this.contentText.set(content);
     this.savedContent.set(content);
