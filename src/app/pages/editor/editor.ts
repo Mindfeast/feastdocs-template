@@ -13,6 +13,8 @@ import {
 import { DomSanitizer, Title, type SafeHtml } from '@angular/platform-browser';
 import { firstValueFrom } from 'rxjs';
 import { ContentService } from '../../core/content.service';
+import { AzureDevOpsService } from '../../core/azure-devops.service';
+import { EntraService } from '../../core/entra.service';
 import { GithubService } from '../../core/github.service';
 import { UiStateService } from '../../core/ui-state.service';
 import { PAGE_ORDER } from '../../generated/page-order';
@@ -21,7 +23,58 @@ import { diffLines, type DiffHunk } from './line-diff';
 
 const LOCAL_API = 'http://127.0.0.1:4271/api';
 
-type Mode = 'local' | 'github';
+/** One changed file, as git reports it: the index column and the worktree one. */
+interface GitChange {
+  readonly status: string;
+  readonly file: string;
+  readonly index: string;
+  readonly worktree: string;
+  readonly staged: boolean;
+  readonly unstaged: boolean;
+}
+
+/** Shape returned by the dev server's /api/git/status. */
+interface GitStatus {
+  readonly git: boolean;
+  readonly branch: string | null;
+  readonly defaultBranch: string;
+  readonly onDefaultBranch: boolean;
+  readonly remote: string | null;
+  readonly hasRemote: boolean;
+  readonly changed: readonly GitChange[];
+  // Optional on purpose: a dev server older than this page omits them, and that
+  // is a state the panel has to be able to recognise rather than mis-render.
+  readonly stagedCount?: number;
+  readonly unstagedCount?: number;
+  /** null until the branch has been pushed once. */
+  readonly upstream: string | null;
+  readonly ahead: number;
+  readonly behind: number;
+  readonly suggestedBranch: string;
+}
+
+/** One entry in the recent-commits list. */
+interface GitCommit {
+  readonly sha: string;
+  readonly subject: string;
+  readonly author: string;
+  readonly date: string;
+  readonly pushed: boolean;
+}
+
+/** Shape returned by the dev server's /api/git/publish. */
+interface PublishResult {
+  readonly ok: boolean;
+  readonly branch?: string;
+  readonly commit?: string;
+  readonly pushed?: boolean;
+  readonly pullRequestUrl?: string | null;
+  readonly note?: string;
+  readonly error?: string;
+  readonly hint?: string;
+}
+
+type Mode = 'local' | 'github' | 'ado';
 
 type Status =
   | { kind: 'idle' }
@@ -93,7 +146,11 @@ const INSERT_SNIPPETS: ReadonlyArray<{ label: string; group: string; text: strin
     group: 'Components',
     text: '\n<fd-api-field name="option" type="string" default="value">\n  What it does.\n</fd-api-field>\n',
   },
-  { label: 'Counter', group: 'Components', text: '\n<fd-counter start="0" step="1"></fd-counter>\n' },
+  {
+    label: 'Counter',
+    group: 'Components',
+    text: '\n<fd-counter start="0" step="1"></fd-counter>\n',
+  },
   {
     label: 'Expandable',
     group: 'Components',
@@ -179,6 +236,10 @@ export class Editor {
   private readonly render = createPreviewRenderer();
   private readonly content = inject(ContentService);
   protected readonly github = inject(GithubService);
+  protected readonly entra = inject(EntraService);
+  /** Site name and logo, for the sign-in card. */
+  protected readonly site = this.content.site;
+  protected readonly ado = inject(AzureDevOpsService);
 
   protected readonly localAvailable = signal<boolean | null>(null);
   protected readonly mode = signal<Mode>('local');
@@ -217,7 +278,8 @@ export class Editor {
   /** The merge resolver, open for one conflicted file at a time. */
   protected readonly resolving = signal<{ path: string; hunks: ResolveHunk[] } | null>(null);
   protected readonly resolveRemaining = computed(
-    () => this.resolving()?.hunks.filter((h) => h.kind === 'conflict' && h.choice === null).length ?? 0,
+    () =>
+      this.resolving()?.hunks.filter((h) => h.kind === 'conflict' && h.choice === null).length ?? 0,
   );
 
   /** The Insert helper menu. */
@@ -542,7 +604,9 @@ export class Editor {
 
     const folder = parentFolder(dragged);
     const siblings = this.sortSiblings(
-      this.visibleFiles().filter((path) => parentFolder(path) === folder && this.isReorderable(path)),
+      this.visibleFiles().filter(
+        (path) => parentFolder(path) === folder && this.isReorderable(path),
+      ),
     );
 
     const next = siblings.filter((path) => path !== dragged);
@@ -705,8 +769,30 @@ export class Editor {
   });
 
   /** Neither backend reachable/configured — explain instead of a dead UI. */
+  /**
+   * Every backend that could serve this session.
+   *
+   * Rendered as tabs whenever there is more than one, and not only when a dev
+   * server is up: a deployed site with both Azure DevOps and GitHub configured
+   * used to pick one and leave the other unreachable.
+   */
+  protected readonly availableModes = computed<Mode[]>(() => {
+    const modes: Mode[] = [];
+    if (this.localAvailable()) modes.push('local');
+    if (this.ado.isConfigured && this.entra.isConfigured) modes.push('ado');
+    if (this.github.isConfigured) modes.push('github');
+    return modes;
+  });
+
+  protected modeLabel(mode: Mode): string {
+    return mode === 'local' ? 'Local' : mode === 'ado' ? 'Azure DevOps' : 'GitHub';
+  }
+
   protected readonly unavailable = computed(
-    () => this.localAvailable() === false && !this.github.isConfigured,
+    () =>
+      this.localAvailable() === false &&
+      !this.github.isConfigured &&
+      !(this.ado.isConfigured && this.entra.isConfigured),
   );
 
   protected readonly needsConnect = computed(
@@ -783,8 +869,645 @@ export class Editor {
     } else {
       this.localAvailable.set(false);
     }
-    if (!this.localAvailable() && this.github.isConfigured) this.mode.set('github');
+    // Azure DevOps first when configured: it edits with the reader's own Entra
+    // token, so a commit carries their name rather than a shared account's.
+    if (!this.localAvailable() && this.ado.isConfigured && this.entra.isConfigured) {
+      this.mode.set('ado');
+    } else if (!this.localAvailable() && this.github.isConfigured) {
+      this.mode.set('github');
+    }
+    await this.entra.ready();
+    await this.refreshBranches();
     await this.refreshFiles();
+    await this.refreshGit();
+    await this.refreshLocalBranches();
+  }
+
+  /* ---- Entra sign-in (deployed site) ------------------------------------- */
+
+  /**
+   * Offered wherever an app registration exists, including locally.
+   *
+   * Hiding it when the dev API answers seemed tidy — you are already yourself on
+   * your own machine — but it also made the sign-in impossible to try without
+   * deploying, which is the wrong trade. The two modes are not exclusive: local
+   * saves keep working, and signing in is how you exercise the online path.
+   */
+  protected readonly canSignIn = computed(() => this.entra.isConfigured);
+  protected readonly signingIn = signal(false);
+
+  protected async signInWithEntra(): Promise<void> {
+    if (this.signingIn()) return;
+    this.signingIn.set(true);
+    try {
+      await this.entra.signIn();
+    } finally {
+      this.signingIn.set(false);
+    }
+  }
+
+  /* ---- publishing (online, Azure DevOps) --------------------------------- */
+
+  protected readonly publishingOnline = signal(false);
+
+  /* ---- which branch am I editing ----------------------------------------- */
+
+  /**
+   * The branch being read and written.
+   *
+   * Editing the default branch means a publish cuts a new branch and opens a pull
+   * request. Selecting an existing branch instead adds a commit to it — which is
+   * how a review comment gets addressed without opening a second pull request for
+   * the same work.
+   */
+  protected readonly branches = signal<readonly string[]>([]);
+  protected readonly workingBranch = signal<string>(this.ado.defaultBranch);
+  protected readonly onDefaultBranch = computed(
+    () => this.workingBranch() === this.ado.defaultBranch,
+  );
+  protected readonly openPullRequest = signal<{ id: number; url: string } | null>(null);
+
+  private async refreshBranches(): Promise<void> {
+    if (this.mode() !== 'ado' || !this.entra.signedIn()) return;
+    try {
+      this.branches.set(await this.ado.listBranches());
+    } catch {
+      // A failure here costs the picker, not the editor.
+      this.branches.set([]);
+    }
+  }
+
+  protected async switchBranch(branch: string): Promise<void> {
+    if (branch === this.workingBranch()) return;
+    if (
+      this.pendingCount() > 0 &&
+      !confirm(`Discard ${this.pendingCount()} staged change(s) and switch to ${branch}?`)
+    ) {
+      return;
+    }
+    this.pending.set(new Map());
+    this.workingBranch.set(branch);
+    this.published.set(null);
+    this.publishError.set(null);
+    this.review.set(null);
+    this.openPullRequest.set(
+      branch === this.ado.defaultBranch
+        ? null
+        : await this.ado.activePullRequest(branch).catch(() => null),
+    );
+    const path = this.selected();
+    await this.refreshFiles();
+    // Reopen the same page on the new branch when it exists there.
+    if (path && this.files().includes(path)) await this.open(path);
+  }
+
+  /* ---- undo -------------------------------------------------------------- */
+
+  /** Throws away unsaved edits in the open file, back to what was last saved. */
+  protected revertBuffer(): void {
+    if (!this.dirty()) return;
+    if (!confirm('Discard your unsaved changes to this file?')) return;
+    this.contentText.set(this.savedContent());
+    this.status.set({ kind: 'saved', detail: 'Reverted to the last saved version' });
+  }
+
+  /** Removes a staged change, so it is not part of the next publish. */
+  protected async discardStaged(path: string, event?: Event): Promise<void> {
+    event?.stopPropagation();
+    if (!confirm(`Discard the staged change to ${path}?`)) return;
+    this.unstage(path);
+    if (this.review()?.path === path) this.review.set(null);
+    // The open file was showing the staged version; put the branch version back.
+    if (this.selected() === path) {
+      try {
+        this.applyOpened(
+          path,
+          await this.ado.readFile(this.content.site.docsDir, path, this.workingBranch()),
+        );
+      } catch {
+        this.status.set({ kind: 'error', message: `Discarded, but could not reload ${path}.` });
+      }
+    }
+  }
+
+  /* ---- see the actual changes -------------------------------------------- */
+
+  /** The staged file currently being reviewed, with its diff against the branch. */
+  protected readonly review = signal<{ path: string; hunks: readonly DiffHunk[] } | null>(null);
+  protected readonly reviewing = signal(false);
+
+  /**
+   * Diffs a staged change against what is on the branch, so the thing being
+   * published can be read before it is sent rather than after.
+   */
+  protected async reviewChange(path: string): Promise<void> {
+    if (this.review()?.path === path) {
+      this.review.set(null);
+      return;
+    }
+    this.reviewing.set(true);
+    try {
+      const staged = this.pending().get(path);
+      const theirs =
+        staged?.kind === 'create'
+          ? ''
+          : await this.ado.readFile(this.content.site.docsDir, path, this.workingBranch());
+      const mine = staged?.kind === 'delete' ? '' : (staged?.content ?? '');
+      this.review.set({ path, hunks: diffLines(theirs, mine) });
+    } catch (error) {
+      this.publishError.set(describe(error, `Could not diff ${path}`));
+    } finally {
+      this.reviewing.set(false);
+    }
+  }
+
+  /** Staged changes as a list, so the template needs no KeyValuePipe. */
+  protected readonly pendingList = computed(() =>
+    [...this.pending()]
+      .map(([path, change]) => ({ path, kind: change.kind }))
+      .sort((a, b) => a.path.localeCompare(b.path)),
+  );
+
+  /**
+   * Stages become a branch, a commit and a pull request in one go.
+   *
+   * Separate from `commitAll()` on purpose: that path is built around GitHub's
+   * tree API and SHA-based conflict detection, and Azure DevOps models a push as
+   * a ref update plus commits, so there is no equivalent sequence to share.
+   */
+  protected async publishOnline(): Promise<void> {
+    if (this.publishingOnline() || this.pendingCount() === 0) return;
+    const branch = this.publishBranch().trim();
+    const message = this.publishMessage().trim();
+    if (branch === '' || message === '') return;
+
+    this.publishingOnline.set(true);
+    this.publishError.set(null);
+    this.published.set(null);
+    try {
+      const result = await this.ado.publish({
+        docsDir: this.content.site.docsDir,
+        branch,
+        onto: this.workingBranch(),
+        message,
+        changes: [...this.pending()].map(([path, change]) => ({
+          path,
+          content: change.content,
+          kind: change.kind,
+        })),
+      });
+      this.published.set({
+        ok: true,
+        branch: result.branch,
+        commit: result.commitId.slice(0, 7),
+        pushed: true,
+        pullRequestUrl: result.pullRequestUrl,
+        note: result.createdBranch
+          ? undefined
+          : `Added to ${result.branch}${result.pullRequestUrl ? '' : ' (no pull request is open for it yet)'}`,
+      });
+      if (result.createdBranch) {
+        this.workingBranch.set(result.branch);
+        await this.refreshBranches();
+      }
+      // The changes are upstream now; keeping them staged would offer to send
+      // them a second time onto a branch that already exists.
+      this.pending.set(new Map());
+      this.publishOpen.set(false);
+    } catch (error) {
+      this.publishError.set(describe(error, 'Publish failed'));
+    } finally {
+      this.publishingOnline.set(false);
+    }
+  }
+
+  /* ---- publishing (local mode) ------------------------------------------ */
+
+  /**
+   * A default branch is usually protected, so a local edit cannot be committed
+   * where the author is standing — it goes onto a fresh branch cut from an
+   * up-to-date default branch, and becomes a pull request. The dev server does
+   * the git work; this is the surface for it.
+   */
+  protected readonly git = signal<GitStatus | null>(null);
+  protected readonly publishOpen = signal(false);
+  protected readonly publishBranch = signal('');
+  protected readonly publishMessage = signal('');
+  protected readonly publishing = signal(false);
+  protected readonly published = signal<PublishResult | null>(null);
+  protected readonly publishError = signal<string | null>(null);
+
+  protected readonly changedCount = computed(() => this.git()?.changed.length ?? 0);
+
+  /** Porcelain status codes, in the words an author would use. */
+  protected changeLabel(status: string): string {
+    if (status.startsWith('?')) return 'new';
+    if (status.includes('D')) return 'deleted';
+    if (status.includes('R')) return 'renamed';
+    if (status.includes('A')) return 'added';
+    return 'edited';
+  }
+
+  /** Reads branch, remote and changed files from the dev server. Local mode only. */
+  private async refreshGit(): Promise<void> {
+    if (this.mode() !== 'local' || !this.localAvailable()) {
+      this.git.set(null);
+      return;
+    }
+    try {
+      this.git.set(await firstValueFrom(this.http.get<GitStatus>(`${LOCAL_API}/git/status`)));
+    } catch {
+      // Older dev server without the git endpoints: hide the feature rather
+      // than show a control that cannot work.
+      this.git.set(null);
+    }
+  }
+
+  /* ---- local: branches, discard, diff ------------------------------------ */
+
+  protected readonly localBranches = signal<readonly string[]>([]);
+  protected readonly switchingBranch = signal(false);
+  /** A unified patch for one changed file, split into lines for colouring. */
+  protected readonly localDiff = signal<{
+    file: string;
+    lines: readonly { kind: 'add' | 'remove' | 'meta' | 'context'; text: string }[];
+  } | null>(null);
+
+  private async refreshLocalBranches(): Promise<void> {
+    if (this.mode() !== 'local' || !this.localAvailable()) return;
+    try {
+      const result = await firstValueFrom(
+        this.http.get<{ branches: string[] }>(`${LOCAL_API}/git/branches`),
+      );
+      this.localBranches.set(result.branches);
+    } catch {
+      this.localBranches.set([]);
+    }
+  }
+
+  /** Checks out an existing branch, so an edit can join a pull request already open. */
+  protected async switchLocalBranch(branch: string): Promise<void> {
+    if (branch === this.git()?.branch || this.switchingBranch()) return;
+    this.switchingBranch.set(true);
+    this.publishError.set(null);
+    try {
+      await firstValueFrom(this.http.post(`${LOCAL_API}/git/switch`, { branch }));
+      this.localDiff.set(null);
+      await this.refreshGit();
+      await this.refreshFiles();
+      const path = this.selected();
+      if (path && this.files().includes(path)) await this.open(path);
+    } catch (error) {
+      this.publishError.set(describe(error, 'Could not switch branch'));
+    } finally {
+      this.switchingBranch.set(false);
+    }
+  }
+
+  /**
+   * Throws away a saved change — the equivalent of "Discard Changes".
+   *
+   * A file that git has never seen cannot be restored, only deleted, so that
+   * needs a second, explicit yes rather than hiding behind the word "discard".
+   */
+  protected async discardLocal(file: string, event?: Event): Promise<void> {
+    event?.stopPropagation();
+    if (!confirm(`Discard your changes to ${file}?`)) return;
+    const send = (allowDelete: boolean) =>
+      firstValueFrom(
+        this.http.post<{ action?: string }>(`${LOCAL_API}/git/discard`, { file, allowDelete }),
+      );
+    try {
+      await send(false);
+    } catch (error) {
+      const payload = (error as { error?: { needsDelete?: boolean; error?: string } })?.error;
+      if (payload?.needsDelete !== true) {
+        this.publishError.set(describe(error, `Could not discard ${file}`));
+        return;
+      }
+      if (!confirm(`${file} is new — discarding it deletes the file. Continue?`)) return;
+      try {
+        await send(true);
+      } catch (retry) {
+        this.publishError.set(describe(retry, `Could not delete ${file}`));
+        return;
+      }
+    }
+    this.localDiff.set(null);
+    await this.refreshGit();
+    // The open file may have just been restored or removed under us.
+    const path = this.selected();
+    if (path && file.endsWith(`/${path}`)) {
+      await this.refreshFiles();
+      if (this.files().includes(path)) await this.open(path);
+      else this.selected.set(null);
+    }
+  }
+
+  /** Shows what actually changed in a file, before it becomes a commit. */
+  protected async diffLocal(file: string): Promise<void> {
+    if (this.localDiff()?.file === file) {
+      this.localDiff.set(null);
+      return;
+    }
+    try {
+      const result = await firstValueFrom(
+        this.http.get<{ patch: string }>(`${LOCAL_API}/git/diff`, { params: { file } }),
+      );
+      const lines = (result.patch ?? '')
+        .split('\n')
+        // The header restates the filename the row already shows.
+        .filter((line, index) => !(index < 4 && /^(diff |index |--- |\+\+\+ )/.test(line)))
+        .map((text) => ({
+          kind: text.startsWith('+')
+            ? ('add' as const)
+            : text.startsWith('-')
+              ? ('remove' as const)
+              : text.startsWith('@@')
+                ? ('meta' as const)
+                : ('context' as const),
+          text,
+        }));
+      this.localDiff.set({ file, lines });
+    } catch (error) {
+      this.publishError.set(describe(error, `Could not diff ${file}`));
+    }
+  }
+
+  /* ---- local: the source-control panel --------------------------------- */
+
+  /**
+   * The steps of a commit, taken one at a time.
+   *
+   * `publish()` below is still the shortcut — branch, commit, push, pull request
+   * in one press — and most edits want exactly that. This is for the edits that
+   * do not fit the shortcut: staging half of what changed, adding a commit to a
+   * branch whose pull request is already open, pushing later, undoing a commit
+   * that went out with the wrong message.
+   */
+  protected readonly scmOpen = signal(false);
+  protected readonly commits = signal<readonly GitCommit[]>([]);
+  protected readonly commitText = signal('');
+  protected readonly newBranch = signal('');
+  protected readonly scmNote = signal<string | null>(null);
+  protected readonly scmLink = signal<string | null>(null);
+
+  /**
+   * Which action is in flight, by name.
+   *
+   * One signal rather than one per button: these all touch the same repository,
+   * so letting two run at once would mean a push racing a branch switch. The name
+   * is what the pressed button shows while it waits.
+   */
+  protected readonly busy = signal<string | null>(null);
+
+  /**
+   * True when the dev server is older than this page.
+   *
+   * `ng serve` reloads the browser on a source change; the API is part of the
+   * `npm start` process and is not reloaded, so a session started before these
+   * endpoints existed serves the old status shape — no `staged` flags, no
+   * upstream. Both lists then come out empty, which looks exactly like a clean
+   * working copy and is the most misleading thing the panel could show. So say
+   * it instead.
+   */
+  protected readonly scmStale = computed(() => {
+    const info = this.git();
+    return info !== null && info.stagedCount === undefined;
+  });
+
+  protected readonly stagedChanges = computed(() =>
+    (this.git()?.changed ?? []).filter((change) => change.staged),
+  );
+  protected readonly unstagedChanges = computed(() =>
+    (this.git()?.changed ?? []).filter((change) => change.unstaged),
+  );
+
+  protected async toggleScm(): Promise<void> {
+    const open = !this.scmOpen();
+    this.scmOpen.set(open);
+    if (!open) return;
+    this.scmNote.set(null);
+    this.publishError.set(null);
+    await this.refreshGit();
+    await this.refreshLocalBranches();
+    await this.refreshCommits();
+  }
+
+  /** One place for "which button is waiting" and for turning a 400 into a sentence. */
+  private async run<T>(label: string, call: () => Promise<T>): Promise<T | null> {
+    if (this.busy() !== null) return null;
+    this.busy.set(label);
+    this.publishError.set(null);
+    this.scmNote.set(null);
+    this.scmLink.set(null);
+    try {
+      return await call();
+    } catch (error) {
+      this.publishError.set(describe(error, `${label} failed`));
+      return null;
+    } finally {
+      this.busy.set(null);
+    }
+  }
+
+  private async refreshCommits(): Promise<void> {
+    if (this.mode() !== 'local' || !this.localAvailable()) return;
+    try {
+      const result = await firstValueFrom(
+        this.http.get<{ commits: GitCommit[] }>(`${LOCAL_API}/git/log`, { params: { limit: 8 } }),
+      );
+      this.commits.set(result.commits);
+    } catch {
+      this.commits.set([]);
+    }
+  }
+
+  protected async stageFiles(files: readonly string[]): Promise<void> {
+    if (files.length === 0) return;
+    const done = await this.run('Stage', () =>
+      firstValueFrom(this.http.post(`${LOCAL_API}/git/stage`, { files })),
+    );
+    if (done !== null) await this.refreshGit();
+  }
+
+  protected async unstageFiles(files: readonly string[]): Promise<void> {
+    if (files.length === 0) return;
+    const done = await this.run('Unstage', () =>
+      firstValueFrom(this.http.post(`${LOCAL_API}/git/unstage`, { files })),
+    );
+    if (done !== null) await this.refreshGit();
+  }
+
+  /**
+   * Discards everything under the docs folder.
+   *
+   * The same two-step as discarding one file, for the same reason: new files can
+   * only be deleted, and the count of them is what makes the difference worth
+   * asking about.
+   */
+  protected async discardAllLocal(): Promise<void> {
+    if (!confirm('Discard every change under docs?')) return;
+    const send = (allowDelete: boolean) =>
+      firstValueFrom(
+        this.http.post<{ restored?: number; deleted?: number }>(`${LOCAL_API}/git/discard-all`, {
+          allowDelete,
+        }),
+      );
+    let result = await this.run('Discard all', () => send(false));
+    if (result === null) {
+      const message = this.publishError() ?? '';
+      if (!/new file/.test(message)) return;
+      if (!confirm(`${message} Continue?`)) return;
+      result = await this.run('Discard all', () => send(true));
+      if (result === null) return;
+    }
+    this.localDiff.set(null);
+    this.scmNote.set(
+      `Discarded ${result.restored ?? 0} change(s)` +
+        (result.deleted ? `, deleted ${result.deleted} new file(s)` : ''),
+    );
+    await this.refreshGit();
+    await this.refreshFiles();
+    const path = this.selected();
+    if (path && !this.files().includes(path)) this.selected.set(null);
+    else if (path) await this.open(path);
+  }
+
+  /** Commits what is staged — or everything, which is what most edits want. */
+  protected async commitLocal(stageAll: boolean): Promise<void> {
+    const message = this.commitText().trim();
+    if (message === '') return;
+    const result = await this.run(stageAll ? 'Commit all' : 'Commit', () =>
+      firstValueFrom(
+        this.http.post<{ commit: string; files: number; warning: string | null }>(
+          `${LOCAL_API}/git/commit`,
+          { message, stageAll },
+        ),
+      ),
+    );
+    if (result === null) return;
+    this.commitText.set('');
+    this.localDiff.set(null);
+    this.scmNote.set(
+      `Committed ${result.files} file(s) as ${result.commit}. ` +
+        (result.warning ?? 'Push it when you are ready.'),
+    );
+    await this.refreshGit();
+    await this.refreshCommits();
+  }
+
+  protected async pushLocal(): Promise<void> {
+    const result = await this.run('Push', () =>
+      firstValueFrom(
+        this.http.post<{ branch: string; pullRequestUrl: string | null }>(
+          `${LOCAL_API}/git/push`,
+          {},
+        ),
+      ),
+    );
+    if (result === null) return;
+    this.scmNote.set(`Pushed ${result.branch}.`);
+    this.scmLink.set(result.pullRequestUrl);
+    await this.refreshGit();
+    await this.refreshCommits();
+  }
+
+  /**
+   * Fetches, and fast-forwards when nothing local is in the way.
+   *
+   * A branch that moved on both sides needs a merge or a rebase, and the dev
+   * server deliberately refuses to pick one — so the note says so rather than
+   * pretending the sync worked.
+   */
+  protected async syncLocal(): Promise<void> {
+    const result = await this.run('Sync', () =>
+      firstValueFrom(
+        this.http.post<{ pulled: boolean; ahead: number; behind: number; note?: string }>(
+          `${LOCAL_API}/git/sync`,
+          {},
+        ),
+      ),
+    );
+    if (result === null) return;
+    this.scmNote.set(
+      result.note ??
+        (result.pulled ? 'Fast-forwarded to the latest.' : 'Fetched — already up to date.'),
+    );
+    await this.refreshGit();
+    await this.refreshCommits();
+    if (result.pulled) await this.refreshFiles();
+  }
+
+  /** Creates a branch from the default branch and moves the current work onto it. */
+  protected async createLocalBranch(): Promise<void> {
+    const branch = this.newBranch().trim();
+    if (branch === '') return;
+    const result = await this.run('New branch', () =>
+      firstValueFrom(
+        this.http.post<{ branch: string; base: string }>(`${LOCAL_API}/git/create-branch`, {
+          branch,
+        }),
+      ),
+    );
+    if (result === null) return;
+    this.newBranch.set('');
+    this.scmNote.set(`On ${result.branch}, taken from ${result.base}.`);
+    await this.refreshGit();
+    await this.refreshLocalBranches();
+    await this.refreshCommits();
+  }
+
+  /**
+   * Puts the last commit back into staging, message and all.
+   *
+   * Refused for a commit the remote already has: undoing that would rewrite
+   * history other people have pulled. The dev server decides that, not this.
+   */
+  protected async undoLastCommit(): Promise<void> {
+    if (!confirm('Undo the last commit? The changes stay staged.')) return;
+    const result = await this.run('Undo', () =>
+      firstValueFrom(this.http.post<{ message: string }>(`${LOCAL_API}/git/undo`, {})),
+    );
+    if (result === null) return;
+    // The message comes back so it can be corrected and used again, which is
+    // usually the whole reason for undoing.
+    if (this.commitText().trim() === '') this.commitText.set((result.message ?? '').trim());
+    this.scmNote.set('Undone — the changes are staged again.');
+    await this.refreshGit();
+    await this.refreshCommits();
+  }
+  protected togglePublish(): void {
+    const open = !this.publishOpen();
+    this.publishOpen.set(open);
+    if (!open) return;
+    this.published.set(null);
+    this.publishError.set(null);
+    const info = this.git();
+    if (info && this.publishBranch() === '') this.publishBranch.set(info.suggestedBranch);
+    if (this.publishMessage() === '') this.publishMessage.set('docs: ');
+  }
+
+  protected async publish(): Promise<void> {
+    if (this.publishing()) return;
+    this.publishing.set(true);
+    this.publishError.set(null);
+    this.published.set(null);
+    try {
+      const result = await firstValueFrom(
+        this.http.post<PublishResult>(`${LOCAL_API}/git/publish`, {
+          branch: this.publishBranch().trim(),
+          message: this.publishMessage().trim(),
+        }),
+      );
+      this.published.set(result);
+      // The branch changed under us, so the status line has to be re-read.
+      await this.refreshGit();
+    } catch (error) {
+      this.publishError.set(describe(error, 'Publish failed'));
+    } finally {
+      this.publishing.set(false);
+    }
   }
 
   /** Kicks off the OAuth authorization redirect. */
@@ -853,6 +1576,9 @@ export class Editor {
       return;
     }
     this.mode.set(mode);
+    if (mode === 'ado') await this.refreshBranches();
+    else this.branches.set([]);
+    this.review.set(null);
     this.selected.set(null);
     this.contentText.set('');
     this.savedContent.set('');
@@ -897,6 +1623,8 @@ export class Editor {
         const tree = await this.github.listTree(this.content.site.docsDir);
         this.baseShas = tree;
         this.files.set([...tree.keys()].sort());
+      } else if (this.mode() === 'ado' && this.entra.signedIn()) {
+        this.files.set(await this.ado.listFiles(this.content.site.docsDir, this.workingBranch()));
       } else {
         return;
       }
@@ -925,6 +1653,11 @@ export class Editor {
           this.http.get<{ content: string }>(`${LOCAL_API}/file`, { params: { path } }),
         );
         this.applyOpened(path, result.content);
+      } else if (this.mode() === 'ado') {
+        this.applyOpened(
+          path,
+          await this.ado.readFile(this.content.site.docsDir, path, this.workingBranch()),
+        );
       } else {
         const file = await this.github.readFile(this.content.site.docsDir, path);
         // Opening refreshes the conflict baseline: whatever we just read IS
@@ -953,6 +1686,8 @@ export class Editor {
         );
         this.savedContent.set(this.contentText());
         this.status.set({ kind: 'saved', detail: 'Saved — the site rebuilds in a moment' });
+        // A save is what turns a clean tree into something publishable.
+        await this.refreshGit();
       } catch (error) {
         this.status.set({ kind: 'error', message: describe(error, 'Save failed') });
       }
@@ -1222,7 +1957,8 @@ export class Editor {
       }
       this.status.set({
         kind: 'error',
-        message: 'The branch kept moving during three attempts — wait a moment and press Commit again.',
+        message:
+          'The branch kept moving during three attempts — wait a moment and press Commit again.',
       });
     } catch (error) {
       this.status.set({ kind: 'error', message: describe(error, 'Commit failed') });
@@ -1261,7 +1997,12 @@ export class Editor {
       return;
     }
 
-    const title = humanize(path.split('/').pop()!.replace(/\.[^.]+$/, ''));
+    const title = humanize(
+      path
+        .split('/')
+        .pop()!
+        .replace(/\.[^.]+$/, ''),
+    );
     let template = `---\ntitle: ${title}\ndescription: \nsidebar_position: 10\n---\n\n# ${title}\n\nStart writing here.\n`;
 
     try {

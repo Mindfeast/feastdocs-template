@@ -1049,3 +1049,440 @@
     outline: none;
   }
 }
+
+// Publish strip. Same shape as the staged-changes bar so the two read as one
+// idea: a thing you are about to do, with the fields it needs beside it.
+.fd-editor__publishbar {
+  flex-wrap: wrap;
+
+  input {
+    flex: 1 1 14rem;
+    min-width: 0;
+  }
+}
+
+.fd-editor__publishnote {
+  margin: 0;
+  padding: 0.5rem 1rem 0.75rem;
+  font-size: 0.875rem;
+  color: var(--fd-text-muted);
+
+  code {
+    font-family: var(--fd-font-mono);
+  }
+
+  a {
+    margin-inline-start: 0.5rem;
+  }
+}
+
+// Pending changes, listed by name. A count is not reviewable; this is the last
+// place to notice a file that should not be going out.
+.fd-editor__pending {
+  margin: 0;
+  padding: 0 1rem 0.75rem;
+  list-style: none;
+  display: grid;
+  gap: 0.25rem;
+  max-height: 12rem;
+  overflow-y: auto;
+  font-size: 0.8125rem;
+
+  li {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+  }
+
+  code {
+    font-family: var(--fd-font-mono);
+    color: var(--fd-text);
+  }
+}
+
+.fd-editor__pendingkind {
+  flex: 0 0 auto;
+  min-width: 4.25rem;
+  padding: 0.0625rem 0.375rem;
+  border-radius: var(--fd-radius-sm, 4px);
+  background: var(--fd-surface-2, rgb(0 0 0 / 6%));
+  color: var(--fd-text-muted);
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  text-align: center;
+}
+
+// Branch picker in the toolbar. A protected branch is still selectable — reading
+// it is normal; it is publishing that forks a new one.
+.fd-editor__branch {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  font-size: 0.8125rem;
+  color: var(--fd-text-muted);
+
+  select {
+    max-width: 16rem;
+    padding: 0.25rem 0.375rem;
+    border: 1px solid var(--fd-border);
+    border-radius: var(--fd-radius-sm, 4px);
+    background: var(--fd-surface);
+    color: var(--fd-text);
+    font: inherit;
+  }
+}
+
+.fd-editor__branchlabel {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.6875rem;
+}
+
+// A staged row: name opens the diff, ✕ discards it.
+.fd-editor__pendingpath {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+
+  &:hover code {
+    text-decoration: underline;
+  }
+}
+
+.fd-editor__pendingdiscard {
+  flex: 0 0 auto;
+  padding: 0 0.25rem;
+  border: 0;
+  background: none;
+  color: var(--fd-text-muted);
+  cursor: pointer;
+
+  &:hover {
+    color: var(--fd-danger, #c0392b);
+  }
+}
+
+// The diff itself: added and removed blocks, tinted rather than prefixed, so a
+// line's own leading characters are never mistaken for diff markers.
+.fd-editor__diff {
+  display: block;
+  margin: 0.25rem 0 0.5rem;
+  border-inline-start: 2px solid var(--fd-border);
+  padding-inline-start: 0.5rem;
+
+  pre {
+    margin: 0;
+    padding: 0.125rem 0.375rem;
+    overflow-x: auto;
+    font-size: 0.75rem;
+    line-height: 1.5;
+    white-space: pre-wrap;
+  }
+}
+
+.fd-editor__diffsame {
+  color: var(--fd-text-muted);
+}
+
+.fd-editor__diffadded {
+  background: color-mix(in srgb, var(--fd-accent-light, #2f6feb) 12%, transparent);
+}
+
+.fd-editor__diffremoved {
+  background: color-mix(in srgb, #c0392b 12%, transparent);
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, #c0392b 40%, transparent);
+}
+
+.fd-editor__diffempty {
+  margin: 0;
+  font-size: 0.75rem;
+  color: var(--fd-text-muted);
+}
+
+// Sign-in gate. A centred card rather than a button in a toolbar: when there is
+// no session there is nothing else to do on this screen, and a card says that.
+// `.fd-editor` is a 280px + 1fr grid with its own full height, so a child that
+// does not opt out lands in the sidebar column. Span both tracks and centre in
+// them, exactly as .fd-editor__offline does.
+.fd-editor__login {
+  grid-column: 1 / -1;
+  place-self: center;
+  width: 100%;
+  padding: 2rem 1rem;
+  display: grid;
+  justify-items: center;
+}
+
+.fd-editor__logincard {
+  width: 100%;
+  max-width: 26rem;
+  padding: 2rem;
+  border: 1px solid var(--fd-border);
+  border-radius: calc(var(--fd-radius, 8px) * 1.5);
+  background: var(--fd-surface);
+  text-align: center;
+
+  h1 {
+    margin: 0.75rem 0 0.25rem;
+    font-size: 1.375rem;
+  }
+}
+
+.fd-editor__loginlogo {
+  height: 34px;
+  width: auto;
+}
+
+.fd-editor__loginlead {
+  margin: 0 0 1.5rem;
+  color: var(--fd-text-muted);
+  font-size: 0.9375rem;
+}
+
+.fd-editor__login .fd-editor__signin {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  width: 100%;
+}
+
+.fd-editor__loginfoot {
+  margin: 1.25rem 0 0;
+  color: var(--fd-text-muted);
+  font-size: 0.8125rem;
+  line-height: 1.6;
+}
+
+// Unified-diff rows for the local backend. Tinted, and the +/- stay visible
+// because they are part of the patch git produced.
+.fd-editor__diffrow {
+  display: block;
+  padding-inline: 0.25rem;
+  white-space: pre-wrap;
+
+  &.is-add {
+    background: color-mix(in srgb, var(--fd-accent-light, #2f6feb) 14%, transparent);
+  }
+
+  &.is-remove {
+    background: color-mix(in srgb, #c0392b 14%, transparent);
+  }
+
+  &.is-meta {
+    color: var(--fd-text-muted);
+    font-style: italic;
+  }
+}
+
+// Source control. Lives in the work pane rather than the 280px sidebar, because
+// a unified diff in a narrow column wraps into something nobody can read.
+.fd-editor__scm {
+  display: grid;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem 1rem;
+  border-block-end: 1px solid var(--fd-border);
+  background: var(--fd-surface-2, rgb(0 0 0 / 2%));
+}
+
+.fd-editor__scmbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.8125rem;
+
+  select,
+  input {
+    padding: 0.25rem 0.375rem;
+    border: 1px solid var(--fd-border);
+    border-radius: var(--fd-radius-sm, 4px);
+    background: var(--fd-surface);
+    color: var(--fd-text);
+    font: inherit;
+  }
+
+  select {
+    max-width: 14rem;
+  }
+
+  input {
+    inline-size: 11rem;
+  }
+}
+
+.fd-editor__scmbranch {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  margin-inline-end: auto;
+  color: var(--fd-text-muted);
+
+  strong {
+    font-family: var(--fd-font-mono);
+    color: var(--fd-text);
+  }
+}
+
+.fd-editor__scmcount {
+  font-family: var(--fd-font-mono);
+  font-size: 0.75rem;
+  color: var(--fd-text-muted);
+}
+
+// Said quietly. It is a fact about the branch, not a problem with the edit.
+.fd-editor__scmwarn {
+  font-style: normal;
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--fd-warning, #b45309);
+}
+
+.fd-editor__scmcommit {
+  display: grid;
+  gap: 0.5rem;
+
+  textarea {
+    inline-size: 100%;
+    padding: 0.4375rem 0.5rem;
+    border: 1px solid var(--fd-border);
+    border-radius: var(--fd-radius-sm, 4px);
+    background: var(--fd-surface);
+    color: var(--fd-text);
+    font: inherit;
+    resize: vertical;
+  }
+}
+
+.fd-editor__scmactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.fd-editor__scmgroup {
+  display: grid;
+  gap: 0.25rem;
+
+  // The list already carries the page padding; inside the panel it would double.
+  .fd-editor__pending {
+    padding-inline: 0;
+    padding-block-end: 0;
+    max-height: 16rem;
+  }
+}
+
+.fd-editor__scmhead {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fd-text-muted);
+
+  > span {
+    padding: 0.0625rem 0.375rem;
+    border-radius: 999px;
+    background: var(--fd-surface-3, rgb(0 0 0 / 8%));
+    font-size: 0.6875rem;
+  }
+
+  code {
+    font-family: var(--fd-font-mono);
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--fd-text);
+  }
+
+  // Bulk actions sit at the far end, away from the per-row buttons: a mis-click
+  // on "Discard all" costs considerably more than one on a single row.
+  button:last-child {
+    margin-inline-start: auto;
+  }
+}
+
+.fd-editor__scmbulk {
+  border: 1px solid var(--fd-border);
+  border-radius: var(--fd-radius-sm, 4px);
+  padding: 0.125rem 0.4375rem;
+  background: var(--fd-surface);
+  color: var(--fd-text-muted);
+  font: inherit;
+  font-size: 0.6875rem;
+  text-transform: none;
+  letter-spacing: 0;
+  cursor: pointer;
+
+  &:hover:not(:disabled) {
+    color: var(--fd-text);
+    border-color: var(--fd-text-muted);
+  }
+
+  &:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+}
+
+.fd-editor__scmdiff {
+  display: grid;
+  gap: 0.25rem;
+
+  pre {
+    margin: 0;
+    max-height: 22rem;
+    overflow: auto;
+    padding: 0.5rem;
+    border: 1px solid var(--fd-border);
+    border-radius: var(--fd-radius-sm, 4px);
+    background: var(--fd-surface);
+    font-size: 0.75rem;
+    line-height: 1.5;
+  }
+}
+
+.fd-editor__scmlog {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.125rem;
+  font-size: 0.8125rem;
+
+  li {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+  }
+
+  code {
+    flex: 0 0 auto;
+    font-family: var(--fd-font-mono);
+    font-size: 0.75rem;
+    color: var(--fd-text-muted);
+  }
+}
+
+.fd-editor__scmsubject {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fd-editor__scmempty {
+  margin: 0;
+  font-size: 0.8125rem;
+  color: var(--fd-text-muted);
+}
