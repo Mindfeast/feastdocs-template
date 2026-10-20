@@ -57,7 +57,7 @@ const sitemapEntries = docs
   .filter((doc) => !doc.hidden)
   .map(
     (doc) =>
-      `  <url><loc>${escapeXml(doc.slug === '' ? `${siteUrl}/` : `${siteUrl}/${doc.slug}`)}</loc>` +
+      `  <url><loc>${escapeXml(pageUrl(siteUrl, doc.slug))}</loc>` +
       `<lastmod>${doc.lastUpdated.slice(0, 10)}</lastmod></url>`,
   )
   .join('\n');
@@ -77,10 +77,27 @@ console.log(
   `${green('✓')} prerendered ${pages} pages, sitemap.xml, robots.txt ${dim(`→ ${path.relative(ROOT, DIST)}`)}`,
 );
 
+/**
+ * The URL a page is actually served at.
+ *
+ * Pages are written as `<slug>/index.html`, so a host that serves directories
+ * — Cloudflare Pages, GitHub Pages — answers `/slug` with a 308 to `/slug/`.
+ * Declaring the slash-less form pointed the sitemap and the canonical at that
+ * redirect instead of at the page: every sitemap URL came back from Search
+ * Console as "Discovered – currently not indexed", and the page served at
+ * `/slug/` claimed `/slug` as canonical, which redirects back to it.
+ *
+ * nginx (deploy/nginx.conf) answers both forms with a 200, so the trailing
+ * slash is the single form that is correct on every host we deploy to.
+ */
+function pageUrl(siteUrl, slug) {
+  return slug === '' ? `${siteUrl}/` : `${siteUrl}/${slug}/`;
+}
+
 function renderPage(shell, doc, config, siteUrl) {
   const title = doc.slug === '' ? config.title : `${doc.title} · ${config.title}`;
   const description = doc.description || config.tagline;
-  const url = doc.slug === '' ? `${siteUrl}/` : `${siteUrl}/${doc.slug}`;
+  const url = pageUrl(siteUrl, doc.slug);
 
   const meta = [
     `<link rel="canonical" href="${escapeAttr(url)}" />`,
